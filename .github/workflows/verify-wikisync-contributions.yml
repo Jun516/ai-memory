@@ -20,10 +20,10 @@ jobs:
         include:
           - case: a
             os: windows-latest
-            commit: 285766b080cec5528080200beb43061f7ce67326
+            commit: 727c75e313a80f4dd3b268697f94611e88ec9fd3
           - case: b
             os: ubuntu-latest
-            commit: 2d6ad6a93cd62cffbffb70e30e94e5d3a53a5ea7
+            commit: c851ca64b95c16c52e8db076ed73a7a116ff0c94
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
@@ -60,7 +60,7 @@ jobs:
           if case == 'a':
               guard = 'if !destination_paths_match(&canonical, &lexical) {'
               assert text.count(guard) == 1
-              baseline = text.replace(guard, 'if canonical != lexical {')
+              baseline = text.replace(guard, 'let _ = destination_paths_match(&canonical, &lexical);\n    if canonical != lexical {')
               test = 'paths::tests::prepare_dest_accepts_plain_windows_absolute_paths'
               expected = '--dest reaches through a symlink'
           else:
@@ -76,6 +76,28 @@ jobs:
               print(result.stdout)
               assert result.returncode != 0, 'Regression did not fail on the original implementation'
               assert expected in result.stdout, 'Failure did not demonstrate the reported defect'
+          finally:
+              path.write_bytes(fixed)
+          PY
+          git diff --exit-code
+      - name: Prove the junction guard rejects ancestor traversal
+        if: ${{ matrix.case == 'a' }}
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import subprocess
+          path = Path('companions/ai-memory-wikisync/src/paths.rs')
+          fixed = path.read_bytes()
+          text = fixed.decode('utf-8')
+          guard = 'if !destination_paths_match(&canonical, &lexical) {'
+          assert text.count(guard) == 1
+          try:
+              path.write_bytes(text.replace(guard, 'let _ = destination_paths_match(&canonical, &lexical);\n    if false {').encode('utf-8'))
+              result = subprocess.run(['cargo', 'test', '--locked', '--manifest-path', 'companions/ai-memory-wikisync/Cargo.toml', 'paths::tests::prepare_dest_refuses_windows_junctions_without_touching_the_target', '--', '--exact', '--nocapture'], text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=1200)
+              print(result.stdout)
+              assert result.returncode != 0, 'Adversarial test did not fail with its guard removed'
+              assert 'unwrap_err()' in result.stdout and 'Ok' in result.stdout, 'Failure did not demonstrate accepted ancestor-junction traversal'
           finally:
               path.write_bytes(fixed)
           PY
