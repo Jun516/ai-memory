@@ -1,4 +1,4 @@
-name: Verify wiki-sync contributions
+name: Verify final wiki-sync contributions
 
 on:
   push:
@@ -10,6 +10,9 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: '-D warnings'
+  CANDIDATE_A_SHA: 4f1db907a9465335291eddde3f8ecb075890ac6a
+  CANDIDATE_B_SHA: 6229390e19559bf148f7bc1ed8d0bd1fc9bf65e4
+  BASE_SHA: 11ab1003d9ef3788f5fc40b87fff54abf7f17dc0
 
 jobs:
   companion:
@@ -20,10 +23,13 @@ jobs:
         include:
           - case: a
             os: windows-latest
-            commit: 727c75e313a80f4dd3b268697f94611e88ec9fd3
+            commit: 4f1db907a9465335291eddde3f8ecb075890ac6a
+          - case: a
+            os: ubuntu-latest
+            commit: 4f1db907a9465335291eddde3f8ecb075890ac6a
           - case: b
             os: ubuntu-latest
-            commit: c851ca64b95c16c52e8db076ed73a7a116ff0c94
+            commit: 6229390e19559bf148f7bc1ed8d0bd1fc9bf65e4
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
@@ -44,6 +50,7 @@ jobs:
         shell: bash
         run: test "$(git rev-parse HEAD)" = '${{ matrix.commit }}'
       - name: Prove the regression fails without the fix
+        if: ${{ matrix.os == 'windows-latest' || matrix.case == 'b' }}
         shell: bash
         env:
           PROBE_CASE: ${{ matrix.case }}
@@ -81,7 +88,7 @@ jobs:
           PY
           git diff --exit-code
       - name: Prove the junction guard rejects ancestor traversal
-        if: ${{ matrix.case == 'a' }}
+        if: ${{ matrix.case == 'a' && matrix.os == 'windows-latest' }}
         shell: bash
         run: |
           python - <<'PY'
@@ -112,3 +119,105 @@ jobs:
         if: ${{ !cancelled() }}
         run: cargo test --locked --manifest-path companions/ai-memory-wikisync/Cargo.toml
 
+
+  root:
+    name: Root gates for both contribution commits
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Require immutable commit inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          for name in CANDIDATE_A_SHA CANDIDATE_B_SHA BASE_SHA; do
+            value="${!name}"
+            [[ "$value" =~ ^[0-9a-f]{40}$ ]] || {
+              echo "::error::$name must be a full commit SHA"
+              exit 1
+            }
+          done
+
+      - name: Checkout candidate A
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.CANDIDATE_A_SHA }}
+          fetch-depth: 0
+          clean: false
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: '1.95.0'
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          workspaces: .
+          key: wikisync-final-root
+      - name: Install nextest
+        uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
+        with:
+          tool: cargo-nextest
+      - name: Install dependency policy checker
+        uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
+        with:
+          tool: cargo-deny
+
+      - name: A - verify source, comparison base and tracked cleanliness
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_A_SHA"
+          git cat-file -e "$BASE_SHA^{commit}"
+          git merge-base --is-ancestor "$BASE_SHA" HEAD
+          git diff --exit-code HEAD --
+          git diff --check "$BASE_SHA"...HEAD
+      - name: A - root formatting
+        run: cargo fmt --all -- --check
+      - name: A - changelog gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts/check-changelog-sections.sh
+          scripts/check-changelog-frozen.sh "$BASE_SHA"
+      - name: A - root Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: A - complete root test tier
+        run: cargo tf
+      - name: A - dependency policy
+        run: cargo deny check
+      - name: A - gates left tracked source unchanged
+        run: git diff --exit-code HEAD --
+
+      # Keep the same target directory and restored cache for the second
+      # candidate. Every gate still runs against B's own checked-out commit.
+      - name: Checkout candidate B
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.CANDIDATE_B_SHA }}
+          fetch-depth: 0
+          clean: false
+          persist-credentials: false
+      - name: B - verify source, comparison base and tracked cleanliness
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_B_SHA"
+          git cat-file -e "$BASE_SHA^{commit}"
+          git merge-base --is-ancestor "$BASE_SHA" HEAD
+          git diff --exit-code HEAD --
+          git diff --check "$BASE_SHA"...HEAD
+      - name: B - root formatting
+        run: cargo fmt --all -- --check
+      - name: B - changelog gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts/check-changelog-sections.sh
+          scripts/check-changelog-frozen.sh "$BASE_SHA"
+      - name: B - root Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: B - complete root test tier
+        run: cargo tf
+      - name: B - dependency policy
+        run: cargo deny check
+      - name: B - gates left tracked source unchanged
+        run: git diff --exit-code HEAD --
