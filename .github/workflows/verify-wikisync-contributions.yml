@@ -1,0 +1,92 @@
+name: Verify wiki-sync contributions
+
+on:
+  push:
+    branches: [verify-wikisync-contributions]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: '-D warnings'
+
+jobs:
+  companion:
+    name: Companion ${{ matrix.case }} (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - case: a
+            os: windows-latest
+            commit: 285766b080cec5528080200beb43061f7ce67326
+          - case: b
+            os: ubuntu-latest
+            commit: 2d6ad6a93cd62cffbffb70e30e94e5d3a53a5ea7
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ matrix.commit }}
+          persist-credentials: false
+          fetch-depth: 2
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          toolchain: '1.95.0'
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16
+        with:
+          workspaces: companions/ai-memory-wikisync
+          key: wikisync-${{ matrix.case }}
+      - name: Verify exact source
+        shell: bash
+        run: test "$(git rev-parse HEAD)" = '${{ matrix.commit }}'
+      - name: Prove the regression fails without the fix
+        shell: bash
+        env:
+          PROBE_CASE: ${{ matrix.case }}
+          PROBE_BASE: 11ab1003d9ef3788f5fc40b87fff54abf7f17dc0
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          import subprocess
+          case = os.environ['PROBE_CASE']
+          path = Path('companions/ai-memory-wikisync/src/' + ('paths.rs' if case == 'a' else 'sync.rs'))
+          fixed = path.read_bytes()
+          text = fixed.decode('utf-8')
+          if case == 'a':
+              guard = 'if !destination_paths_match(&canonical, &lexical) {'
+              assert text.count(guard) == 1
+              baseline = text.replace(guard, 'if canonical != lexical {')
+              test = 'paths::tests::prepare_dest_accepts_plain_windows_absolute_paths'
+              expected = '--dest reaches through a symlink'
+          else:
+              old = subprocess.check_output(['git', 'show', os.environ['PROBE_BASE'] + ':' + path.as_posix()]).decode('utf-8')
+              marker = '#[cfg(test)]'
+              assert text.count(marker) == old.count(marker) == 1
+              baseline = old.split(marker, 1)[0] + marker + text.split(marker, 1)[1]
+              test = 'sync::tests::diff_summary_reports_appended_and_removed_lines'
+              expected = 'first difference at line 0'
+          try:
+              path.write_bytes(baseline.encode('utf-8'))
+              result = subprocess.run(['cargo', 'test', '--locked', '--manifest-path', 'companions/ai-memory-wikisync/Cargo.toml', test, '--', '--exact', '--nocapture'], text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=1200)
+              print(result.stdout)
+              assert result.returncode != 0, 'Regression did not fail on the original implementation'
+              assert expected in result.stdout, 'Failure did not demonstrate the reported defect'
+          finally:
+              path.write_bytes(fixed)
+          PY
+          git diff --exit-code
+      - name: Companion formatting
+        if: ${{ !cancelled() }}
+        run: cargo fmt --check --manifest-path companions/ai-memory-wikisync/Cargo.toml
+      - name: Companion Clippy
+        if: ${{ !cancelled() }}
+        run: cargo clippy --locked --manifest-path companions/ai-memory-wikisync/Cargo.toml --all-targets -- -D warnings
+      - name: Complete companion tests
+        if: ${{ !cancelled() }}
+        run: cargo test --locked --manifest-path companions/ai-memory-wikisync/Cargo.toml
+
